@@ -1,0 +1,4 @@
+# Local MONAI model weights
+bundles/*/models/*.pt
+bundles/*/models/*.ts
+bundles/*/.cache/
