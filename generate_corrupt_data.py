@@ -162,12 +162,33 @@ def corrupt_lower_part_nlst_data(num_cases: int = 10, start_case: int = 0, docum
             "removed_fraction": removed_fraction
         }
         
+def crop_images(num_cases: int = 10, start_case: int = 0, start: int = 0, percentage: float = 0.5, documentation: pd.DataFrame = None) -> None:
+    case_files = sorted(glob(os.path.join(DATA_DIR, "*.nii.gz")))[start_case:start_case + num_cases]
+    for case_file in case_files:
+        img = nib.load(case_file)
+        data = img.get_fdata()
+        # crop the image to the upper half
+        cropped_data = data[:, :, start:start + int(data.shape[2] * percentage)]
+        cropped_img = nib.Nifti1Image(cropped_data, img.affine, img.header)
+        cropped_case_file = os.path.join(CORRUPTED_DATA_DIR, os.path.basename(case_file).replace(".nii.gz", "_cropped.nii.gz"))
+        nib.save(cropped_img, cropped_case_file)
+        print(f"Cropped {case_file} and saved to {cropped_case_file}")
+        # documentation
+        documentation.loc[len(documentation)] = {
+            "filename": os.path.basename(case_file),
+            "corruption_type": "cropping",
+            "z_start": start,
+            "z_end": start + int(data.shape[2] * percentage),
+            "removed_slices": data.shape[2] - int(data.shape[2] * percentage),
+            "removed_fraction": 1 - percentage
+        }
+        
 if __name__ == "__main__":
     # documentation cv:
     documentation = pd.DataFrame(columns=["filename", "corruption_type", "z_start", "z_end", "removed_slices", "removed_fraction"])
-    corrupt_upper_part_nlst_data(num_cases=10, start_case=0, documentation=documentation)
-    corrupt_partial_upper_part_nlst_data(num_cases=10, start_case=10, documentation=documentation)
-    corrupt_lower_part_nlst_data(num_cases=10, start_case=20, documentation=documentation)
+    #corrupt_upper_part_nlst_data(num_cases=10, start_case=0, documentation=documentation)
+    #corrupt_partial_upper_part_nlst_data(num_cases=10, start_case=10, documentation=documentation)
+    #corrupt_lower_part_nlst_data(num_cases=10, start_case=20, documentation=documentation)
+    crop_images(num_cases=10, start_case=0, start=0, percentage=0.5, documentation=documentation)
 
-    
     documentation.to_csv(os.path.join(os.path.join(PROJECT_ROOT, "nlst_detection_outputs"), "corruption_documentation.csv"), index=False)
