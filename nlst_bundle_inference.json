@@ -1,7 +1,7 @@
 {
-    "dataset_dir": "../../../NLST/corrupted_imagesTr",
+    "dataset_dir": "../../../NLST/imagesTr",
     "output_dir": "../../../nlst_detection_outputs",
-    "output_filename": "nlst_lung_nodule_corrupted_predictions.json",
+    "output_filename": "nlst_lung_nodule_predictions.json",
     "nlst_start_case": 0,
     "nlst_max_cases": 1,
     "checkpointloader": {

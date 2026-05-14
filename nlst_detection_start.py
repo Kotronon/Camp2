@@ -13,14 +13,30 @@ import subprocess
 import sys
 
 PROJECT_ROOT = os.path.dirname(os.path.abspath(__file__))
-DATA_DIR = os.path.join(PROJECT_ROOT, "NLST", "corrupted_imagesTr")
+ORIGINAL_DATA_DIR = os.path.join(PROJECT_ROOT, "NLST", "imagesTr")
+CORRUPTED_DATA_DIR = os.path.join(PROJECT_ROOT, "NLST", "corrupted_imagesTr")
 BUNDLE_DIR = os.path.join(PROJECT_ROOT, "model-zoo", "models", "lung_nodule_ct_detection")
 CHECKPOINT = os.path.join(BUNDLE_DIR, "models", "model.pt")
 CPU_CHECKPOINT = os.path.join(BUNDLE_DIR, "models", "model_cpu.pt")
 OUTPUT_DIR = os.path.join(PROJECT_ROOT, "nlst_detection_outputs")
 
 
+def require_module(module_name: str, install_hint: str) -> None:
+    try:
+        __import__(module_name)
+    except ModuleNotFoundError as exc:
+        raise SystemExit(
+            f"Missing Python dependency '{module_name}' in {sys.executable}.\n"
+            f"Use the project environment first, for example:\n"
+            f"  conda activate monai-nlst\n"
+            f"or run explicitly with:\n"
+            f"  /Users/kathi/miniforge3/envs/monai-nlst/bin/python {os.path.basename(__file__)} ...\n"
+            f"Install hint: {install_hint}"
+        ) from exc
+
+
 def ensure_cpu_checkpoint_if_needed() -> None:
+    require_module("torch", "pip install torch")
     import torch
 
     if torch.cuda.is_available():
@@ -34,13 +50,30 @@ def ensure_cpu_checkpoint_if_needed() -> None:
     torch.save(checkpoint, CPU_CHECKPOINT)
 
 
-def run_bundle_inference(max_cases: int, start_case: int) -> None:
+def default_output_filename(data_mode: str) -> str:
+    if data_mode == "clean":
+        return "nlst_lung_nodule_predictions.json"
+    if data_mode == "corrupted":
+        return "nlst_lung_nodule_corrupted_predictions.json"
+    return "nlst_lung_nodule_predictions_custom.json"
+
+
+def run_bundle_inference(
+    max_cases: int,
+    start_case: int,
+    dataset_dir: str,
+    output_filename: str,
+) -> None:
     if not os.path.exists(BUNDLE_DIR):
         raise FileNotFoundError(f"MONAI Bundle not found: {BUNDLE_DIR}")
 
     if not os.path.exists(CHECKPOINT):
         raise FileNotFoundError(f"Pretrained Checkpoint missing: {CHECKPOINT}")
 
+    if not os.path.isdir(dataset_dir):
+        raise FileNotFoundError(f"Dataset folder not found: {dataset_dir}")
+
+    require_module("monai", "pip install 'monai[all]'")
     ensure_cpu_checkpoint_if_needed()
     os.makedirs(OUTPUT_DIR, exist_ok=True)
 
@@ -56,14 +89,22 @@ def run_bundle_inference(max_cases: int, start_case: int) -> None:
         str(max_cases),
         "--nlst_start_case",
         str(start_case),
+        "--dataset_dir",
+        dataset_dir,
+        "--output_dir",
+        OUTPUT_DIR,
+        "--output_filename",
+        output_filename,
     ]
 
     print("Starting MONAI Model-Zoo Inference:")
+    print(f"Dataset: {dataset_dir}")
+    print(f"Output:  {os.path.join(OUTPUT_DIR, output_filename)}")
     print(" ".join(command))
     subprocess.run(command, cwd=BUNDLE_DIR, check=True)
 
 
-def preview_first_volume() -> None:
+def preview_first_volume(dataset_dir: str) -> None:
     import matplotlib.pyplot as plt
     from monai.data import DataLoader, Dataset
     from monai.transforms import (
@@ -78,12 +119,12 @@ def preview_first_volume() -> None:
 
     set_determinism(seed=0)
 
-    if not os.path.exists(DATA_DIR):
+    if not os.path.exists(dataset_dir):
         print("Please download the NLST dataset and extract it to NLST/imagesTr.")
         print("The folder should contain e.g., NLST/imagesTr/NLST_0001_0000.nii.gz.")
         sys.exit(1)
 
-    image_files = sorted(glob.glob(os.path.join(DATA_DIR, "*.nii.gz")))
+    image_files = sorted(glob.glob(os.path.join(dataset_dir, "*.nii.gz")))
     if not image_files:
         raise FileNotFoundError(f"No .nii.gz files found in folder: {DATA_DIR}")
 
@@ -134,7 +175,7 @@ def main() -> None:
     parser.add_argument(
         "--max-cases",
         type=int,
-        default=1,
+        default=30,
         help="Number of NLST volumes for the bundle inference. Test with a small number first.",
     )
     parser.add_argument(
@@ -143,12 +184,33 @@ def main() -> None:
         default=0,
         help="Start index for NLST cases to process. Useful for batch processing.‚",
     )
+    parser.add_argument(
+        "--data-mode",
+        choices=["clean", "corrupted"],
+        default="clean",
+        help="Use original NLST/imagesTr or generated NLST/corrupted_imagesTr.",
+    )
+    parser.add_argument(
+        "--dataset-dir",
+        default=None,
+        help="Optional explicit dataset folder. Overrides --data-mode.",
+    )
+    parser.add_argument(
+        "--output-filename",
+        default=None,
+        help="Output JSON filename inside nlst_detection_outputs.",
+    )
     args = parser.parse_args()
 
+    dataset_dir = args.dataset_dir
+    if dataset_dir is None:
+        dataset_dir = ORIGINAL_DATA_DIR if args.data_mode == "clean" else CORRUPTED_DATA_DIR
+    output_filename = args.output_filename or default_output_filename(args.data_mode)
+
     if args.run_bundle:
-        run_bundle_inference(args.max_cases, args.start_case)
+        run_bundle_inference(args.max_cases, args.start_case, dataset_dir, output_filename)
     else:
-        preview_first_volume()
+        preview_first_volume(dataset_dir)
 
 
 if __name__ == "__main__":

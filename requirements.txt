@@ -2,6 +2,9 @@ monai[all]
 torch
 torchvision
 nibabel
+pytorch-ignite
+scikit-image
+einops
 pydicom
 matplotlib
 jupyter

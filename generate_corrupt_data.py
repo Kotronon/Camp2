@@ -1,237 +1,310 @@
-'''
-Generate corrupt data for testing purposes.
-For that purpose, we will take the first 10 cases of the NLST dataset and corrupt them by setting the upper lung pixel values to the same value as air.
-This will create a scenario where the upper lung is not visible, which can be used to test the robustness of our models against corrupted data.
-At the same time, we will keep the lower lung intact, so that the models can still make predictions based on the lower lung, which is a common scenario 
-in real-world data where some parts of the image may be corrupted while others are still usable.
-As bonus we could cut some slices from the upper lung to create a scenario where the upper lung is partially visible, which can also be used to test the robustness of our models against corrupted data.
-Or where we cut the lower part of the lung, which can also be used to test the robustness of our models against corrupted data.
+#!/usr/bin/env python3
+"""
+Generate reproducible NLST corruptions for robustness analysis.
 
-Document per image: filename; filename, corruption_type, z_start, z_end, removed_slices, removed_fraction
+The default run creates 30 comparable cases with unchanged filenames:
+10 targeted lung-region occlusions, 10 full-slice dropouts, and 10 low-dose
+noise corruptions. This separates a targeted anatomical ablation from more
+realistic acquisition-style corruptions.
+"""
 
-Important: Remove slides from lungs (use NLST/masksTR to identify lung area) and not from the upper part of the image, which may contain other structures. 
-Otherwise, we would create a scenario that is not realistic and may not be useful for testing the robustness of our models against corrupted data.
-'''
+from __future__ import annotations
 
+import argparse
 import os
-import numpy as np
-import nibabel as nib
 from glob import glob
+from pathlib import Path
+
+import nibabel as nib
+import numpy as np
 import pandas as pd
 
-PROJECT_ROOT = os.path.dirname(os.path.abspath(__file__))
-DATA_DIR = os.path.join(PROJECT_ROOT, "NLST", "imagesTr")
-CORRUPTED_DATA_DIR = os.path.join(PROJECT_ROOT, "NLST", "corrupted_imagesTr")
-os.makedirs(CORRUPTED_DATA_DIR, exist_ok=True)
 
-def corrupt_upper_part_nlst_data(num_cases: int = 10, start_case: int = 0, documentation: pd.DataFrame = None) -> None:
-    case_files = sorted(glob(os.path.join(DATA_DIR, "*.nii.gz")))[start_case:start_case + num_cases]
-    for case_file in case_files:
-        img = nib.load(case_file)
-        data = img.get_fdata()
-        # get upper part of the lung and set it to air (-1000 HU)
-        # This would require loading the lung mask and identifying the upper lung region
-        lung_mask_file = case_file.replace("imagesTr", "masksTr")
-        if not os.path.exists(lung_mask_file):
-            print(f"Warning: Lung mask not found for {case_file}. Skipping corruption for this case.")
-            continue
-        lung_mask = nib.load(lung_mask_file).get_fdata()
-        # Identify the upper lung region using the lung mask
-        # For simplicity, we will assume the upper lung is in the upper half of the image
-        upper_lung_region = lung_mask > 0
-        if not np.any(upper_lung_region):
-            print(f"Warning: No upper lung region found for {case_file}. Skipping corruption for this case.")
-            continue
+PROJECT_ROOT = Path(__file__).resolve().parent
+DATA_DIR = PROJECT_ROOT / "NLST" / "imagesTr"
+MASK_DIR = PROJECT_ROOT / "NLST" / "masksTr"
+CORRUPTED_DATA_DIR = PROJECT_ROOT / "NLST" / "corrupted_imagesTr"
+OUTPUT_DIR = PROJECT_ROOT / "nlst_detection_outputs"
+DOCUMENTATION_PATH = OUTPUT_DIR / "corruption_documentation.csv"
+AIR_HU = -1000.0
 
-        # Set upper lung pixel values to air (e.g., -1000 HU) only in lung regions
-        upper_lung_threshold = data.shape[2] // 2
-        # Create mask for upper lung region
-        upper_region_mask = np.zeros_like(data, dtype=bool)
-        upper_region_mask[:, :, :upper_lung_threshold] = True
-        # Apply corruption only where lung_mask > 0 and in upper region
-        data[(lung_mask > 0) & upper_region_mask] = -1000
-        
-        # Calculate modified slices (z-slices with at least one modified voxel)
-        modified_slices_mask = np.any((lung_mask > 0) & upper_region_mask, axis=(0, 1))
-        num_modified_slices = np.sum(modified_slices_mask)
-        removed_fraction = num_modified_slices / upper_lung_threshold
-        
-        # Save the corrupted image
-        corrupted_img = nib.Nifti1Image(data, img.affine, img.header)
-        corrupted_case_file = os.path.join(CORRUPTED_DATA_DIR, os.path.basename(case_file))
-        nib.save(corrupted_img, corrupted_case_file)
-        print(f"Corrupted {case_file} and saved to {corrupted_case_file}")
-        # documentation
-        documentation.loc[len(documentation)] = {
-            "filename": os.path.basename(case_file),
-            "corruption_type": "upper_lung_corruption",
-            "z_start": 0,
-            "z_end": upper_lung_threshold,
-            "removed_slices": num_modified_slices,
-            "removed_fraction": removed_fraction
-        }
-        
-def corrupt_partial_upper_part_nlst_data(num_cases: int = 10, start_case: int = 0, documentation: pd.DataFrame = None) -> None:
-    case_files = sorted(glob(os.path.join(DATA_DIR, "*.nii.gz")))[start_case:start_case + num_cases]
-    for case_file in case_files:
-        img = nib.load(case_file)
-        data = img.get_fdata()
-        
-        # get upper part of the lung and set it to air (-1000 HU)
-        # This would require loading the lung mask and identifying the upper lung region
-        lung_mask_file = case_file.replace("imagesTr", "masksTr")
-        if not os.path.exists(lung_mask_file):
-            print(f"Warning: Lung mask not found for {case_file}. Skipping corruption for this case.")
-            continue
-        lung_mask = nib.load(lung_mask_file).get_fdata()
-        # Identify the upper lung region using the lung mask
-        # For simplicity, we will assume the upper lung is in the upper half of the image
-        upper_lung_region = lung_mask > 0
-        if not np.any(upper_lung_region):
-            print(f"Warning: No upper lung region found for {case_file}. Skipping corruption for this case.")
-            continue
-        
-        # Set upper lung pixel values to air (e.g., -1000 HU) for the upper quarter of the image
-        upper_lung_threshold = data.shape[2] // 4
-        upper_region_mask = np.zeros_like(data, dtype=bool)
-        upper_region_mask[:, :, :upper_lung_threshold] = True
-        data[(lung_mask > 0) & upper_region_mask] = -1000
-        
-        # Calculate modified slices (z-slices with at least one modified voxel)
-        modified_slices_mask = np.any((lung_mask > 0) & upper_region_mask, axis=(0, 1))
-        num_modified_slices = np.sum(modified_slices_mask)
-        removed_fraction = num_modified_slices / upper_lung_threshold
-        
-        # Save the corrupted image
-        corrupted_img = nib.Nifti1Image(data, img.affine, img.header)
-        corrupted_case_file = os.path.join(CORRUPTED_DATA_DIR, os.path.basename(case_file))
-        nib.save(corrupted_img, corrupted_case_file)
-        print(f"Partially corrupted {case_file} and saved to {corrupted_case_file}")
-        # documentation
-        documentation.loc[len(documentation)] = {
-            "filename": os.path.basename(case_file),
-            "corruption_type": "upper_lung_corruption",
-            "z_start": 0,
-            "z_end": upper_lung_threshold,
-            "removed_slices": num_modified_slices,
-            "removed_fraction": removed_fraction
-        }
+DOCUMENTATION_COLUMNS = [
+    "filename",
+    "corruption_type",
+    "z_start",
+    "z_end",
+    "removed_slices",
+    "removed_fraction",
+    "changed_voxels",
+    "lung_voxels",
+    "changed_lung_fraction",
+    "noise_sigma_hu",
+    "quality_issue_fraction",
+    "supports_region_filter",
+]
 
-def corrupt_lower_part_nlst_data(num_cases: int = 10, start_case: int = 0, documentation: pd.DataFrame = None) -> None:
-    case_files = sorted(glob(os.path.join(DATA_DIR, "*.nii.gz")))[start_case:start_case + num_cases]
-    for case_file in case_files:
-        img = nib.load(case_file)
-        data = img.get_fdata()
-        # get upper part of the lung and set it to air (-1000 HU)
-        # This would require loading the lung mask and identifying the upper lung region
-        lung_mask_file = case_file.replace("imagesTr", "masksTr")
-        if not os.path.exists(lung_mask_file):
-            print(f"Warning: Lung mask not found for {case_file}. Skipping corruption for this case.")
-            continue
-        lung_mask = nib.load(lung_mask_file).get_fdata()
-        # Identify the upper lung region using the lung mask
-        # For simplicity, we will assume the upper lung is in the upper half of the image
-        upper_lung_region = lung_mask > 0
-        if not np.any(upper_lung_region):
-            print(f"Warning: No upper lung region found for {case_file}. Skipping corruption for this case.")
-            continue
-        # Set lower lung pixel values to air (e.g., -1000 HU) for the lower quarter of the image
-        lower_lung_threshold = data.shape[2] * 3 // 4
-        lower_region_mask = np.zeros_like(data, dtype=bool)
-        lower_region_mask[:, :, lower_lung_threshold:] = True
-        data[(lung_mask > 0) & lower_region_mask] = -1000
-        
-        # Calculate modified slices (z-slices with at least one modified voxel)
-        modified_slices_mask = np.any((lung_mask > 0) & lower_region_mask, axis=(0, 1))
-        num_modified_slices = np.sum(modified_slices_mask)
-        total_slices_in_region = data.shape[2] - lower_lung_threshold
-        removed_fraction = num_modified_slices / total_slices_in_region
-        
-        # Save the corrupted image
-        corrupted_img = nib.Nifti1Image(data, img.affine, img.header)
-        corrupted_case_file = os.path.join(CORRUPTED_DATA_DIR, os.path.basename(case_file))
-        nib.save(corrupted_img, corrupted_case_file)
-        print(f"lower corrupted {case_file} and saved to {corrupted_case_file}")
-        # documentation
-        documentation.loc[len(documentation)] = {
-            "filename": os.path.basename(case_file),
-            "corruption_type": "lower_lung_corruption",
-            "z_start": lower_lung_threshold,
-            "z_end": data.shape[2] - 1,
-            "removed_slices": num_modified_slices,
-            "removed_fraction": removed_fraction
-        }
-        
-def crop_images_z_axis(num_cases: int = 10, start_case: int = 0, start: int = 0, percentage: float = 0.5, documentation: pd.DataFrame = None) -> None:
-    case_files = sorted(glob(os.path.join(DATA_DIR, "*.nii.gz")))[start_case:start_case + num_cases]
-    for case_file in case_files:
-        img = nib.load(case_file)
-        data = img.get_fdata()
-        # crop the image to the upper half
-        cropped_data = data[:, :, start:start + int(data.shape[2] * percentage)]
-        cropped_img = nib.Nifti1Image(cropped_data, img.affine, img.header)
-        cropped_case_file = os.path.join(CORRUPTED_DATA_DIR, os.path.basename(case_file).replace(".nii.gz", "_cropped.nii.gz"))
-        nib.save(cropped_img, cropped_case_file)
-        print(f"Cropped {case_file} and saved to {cropped_case_file}")
-        # documentation
-        documentation.loc[len(documentation)] = {
-            "filename": os.path.basename(case_file),
-            "corruption_type": "cropping",
-            "z_start": start,
-            "z_end": start + int(data.shape[2] * percentage),
-            "removed_slices": data.shape[2] - int(data.shape[2] * percentage),
-            "removed_fraction": 1 - percentage
-        }
 
-def crop_images_x_axis(num_cases: int = 10, start_case: int = 0, start: int = 0, percentage: float = 0.5, documentation: pd.DataFrame = None) -> None:
-    case_files = sorted(glob(os.path.join(DATA_DIR, "*.nii.gz")))[start_case:start_case + num_cases]
-    for case_file in case_files:
-        img = nib.load(case_file)
-        data = img.get_fdata()
-        # crop the image to the upper half
-        cropped_data = data[start:start + int(data.shape[0] * percentage), :, :]
-        cropped_img = nib.Nifti1Image(cropped_data, img.affine, img.header)
-        cropped_case_file = os.path.join(CORRUPTED_DATA_DIR, os.path.basename(case_file).replace(".nii.gz", "_cropped_x.nii.gz"))
-        nib.save(cropped_img, cropped_case_file)
-        print(f"Cropped {case_file} and saved to {cropped_case_file}")
-        # documentation
-        documentation.loc[len(documentation)] = {
-            "filename": os.path.basename(case_file),
-            "corruption_type": "cropping_x",
-            "z_start": start,
-            "z_end": start + int(data.shape[0] * percentage),
-            "removed_slices": data.shape[0] - int(data.shape[0] * percentage),
-            "removed_fraction": 1 - percentage
-        }
-        
-def crop_images_y_axis(num_cases: int = 10, start_case: int = 0, start: int = 0, percentage: float = 0.5, documentation: pd.DataFrame = None) -> None:
-    case_files = sorted(glob(os.path.join(DATA_DIR, "*.nii.gz")))[start_case:start_case + num_cases]
-    for case_file in case_files:
-        img = nib.load(case_file)
-        data = img.get_fdata()
-        # crop the image to the upper half
-        cropped_data = data[:, start:start + int(data.shape[1] * percentage), :]
-        cropped_img = nib.Nifti1Image(cropped_data, img.affine, img.header)
-        cropped_case_file = os.path.join(CORRUPTED_DATA_DIR, os.path.basename(case_file).replace(".nii.gz", "_cropped_y.nii.gz"))
-        nib.save(cropped_img, cropped_case_file)
-        print(f"Cropped {case_file} and saved to {cropped_case_file}")
-        # documentation
-        documentation.loc[len(documentation)] = {
-            "filename": os.path.basename(case_file),
-            "corruption_type": "cropping_y",
-            "z_start": start,
-            "z_end": start + int(data.shape[1] * percentage),
-            "removed_slices": data.shape[1] - int(data.shape[1] * percentage),
-            "removed_fraction": 1 - percentage
-        }
-        
+def list_cases(data_dir: Path) -> list[Path]:
+    return [Path(path) for path in sorted(glob(str(data_dir / "*.nii.gz")))]
+
+
+def mask_path_for(case_file: Path) -> Path:
+    return MASK_DIR / case_file.name
+
+
+def axial_region_mask(shape: tuple[int, int, int], z_start: int, z_end: int) -> np.ndarray:
+    region_mask = np.zeros(shape, dtype=bool)
+    region_mask[:, :, z_start:z_end] = True
+    return region_mask
+
+
+def load_case_and_mask(case_file: Path) -> tuple[nib.Nifti1Image, np.ndarray, np.ndarray] | None:
+    mask_file = mask_path_for(case_file)
+    if not mask_file.exists():
+        print(f"Warning: lung mask not found for {case_file.name}; skipping.")
+        return None
+
+    img = nib.load(str(case_file))
+    data = img.get_fdata(dtype=np.float32)
+    lung_mask = nib.load(str(mask_file)).get_fdata() > 0
+
+    if data.shape != lung_mask.shape:
+        print(f"Warning: image/mask shape mismatch for {case_file.name}; skipping.")
+        return None
+    return img, data, lung_mask
+
+
+def base_row(
+    case_file: Path,
+    corruption_type: str,
+    z_start: int,
+    z_end_exclusive: int,
+    changed_mask: np.ndarray,
+    lung_mask: np.ndarray,
+    noise_sigma_hu: float = 0.0,
+    quality_issue_fraction: float | None = None,
+    supports_region_filter: bool = True,
+) -> dict:
+    changed_slices = np.any(changed_mask, axis=(0, 1))
+    changed_voxels = int(changed_mask.sum())
+    lung_voxels = int(lung_mask.sum())
+    changed_lung_voxels = int((changed_mask & lung_mask).sum())
+    region_slices = max(z_end_exclusive - z_start, 1)
+    removed_fraction = float(changed_slices.sum() / region_slices)
+
+    if quality_issue_fraction is None:
+        quality_issue_fraction = removed_fraction
+
+    return {
+        "filename": case_file.name,
+        "corruption_type": corruption_type,
+        "z_start": z_start,
+        "z_end": z_end_exclusive - 1,
+        "removed_slices": int(changed_slices.sum()),
+        "removed_fraction": removed_fraction,
+        "changed_voxels": changed_voxels,
+        "lung_voxels": lung_voxels,
+        "changed_lung_fraction": float(changed_lung_voxels / lung_voxels) if lung_voxels else 0.0,
+        "noise_sigma_hu": noise_sigma_hu,
+        "quality_issue_fraction": quality_issue_fraction,
+        "supports_region_filter": supports_region_filter,
+    }
+
+
+def save_corrupted(case_file: Path, img: nib.Nifti1Image, data: np.ndarray, output_dir: Path) -> Path:
+    output_file = output_dir / case_file.name
+    nib.save(nib.Nifti1Image(data, img.affine, img.header), str(output_file))
+    return output_file
+
+
+def corrupt_lung_region_occlusion(case_file: Path, output_dir: Path) -> dict | None:
+    loaded = load_case_and_mask(case_file)
+    if loaded is None:
+        return None
+    img, data, lung_mask = loaded
+
+    z_start, z_end = 0, data.shape[2] // 2
+    region_mask = axial_region_mask(data.shape, z_start, z_end)
+    corruption_mask = lung_mask & region_mask
+
+    if not np.any(corruption_mask):
+        print(f"Warning: selected lung region empty for {case_file.name}; skipping.")
+        return None
+
+    data[corruption_mask] = AIR_HU
+    output_file = save_corrupted(case_file, img, data, output_dir)
+    row = base_row(
+        case_file=case_file,
+        corruption_type="lung_region_occlusion",
+        z_start=z_start,
+        z_end_exclusive=z_end,
+        changed_mask=corruption_mask,
+        lung_mask=lung_mask,
+        supports_region_filter=True,
+    )
+    print(f"{case_file.name}: lung_region_occlusion -> {output_file}")
+    return row
+
+
+def corrupt_full_slice_dropout(case_file: Path, output_dir: Path) -> dict | None:
+    loaded = load_case_and_mask(case_file)
+    if loaded is None:
+        return None
+    img, data, lung_mask = loaded
+
+    z_start, z_end = data.shape[2] // 4, data.shape[2] // 2
+    corruption_mask = axial_region_mask(data.shape, z_start, z_end)
+    if not np.any(corruption_mask):
+        print(f"Warning: selected slice region empty for {case_file.name}; skipping.")
+        return None
+
+    data[corruption_mask] = AIR_HU
+    output_file = save_corrupted(case_file, img, data, output_dir)
+    row = base_row(
+        case_file=case_file,
+        corruption_type="full_slice_dropout",
+        z_start=z_start,
+        z_end_exclusive=z_end,
+        changed_mask=corruption_mask,
+        lung_mask=lung_mask,
+        supports_region_filter=True,
+    )
+    print(f"{case_file.name}: full_slice_dropout -> {output_file}")
+    return row
+
+
+def corrupt_low_dose_noise(
+    case_file: Path,
+    output_dir: Path,
+    rng: np.random.Generator,
+    noise_sigma_hu: float,
+) -> dict | None:
+    loaded = load_case_and_mask(case_file)
+    if loaded is None:
+        return None
+    img, data, lung_mask = loaded
+
+    body_mask = data > -950
+    if not np.any(body_mask):
+        print(f"Warning: body mask empty for {case_file.name}; skipping.")
+        return None
+
+    noise = rng.normal(loc=0.0, scale=noise_sigma_hu, size=int(body_mask.sum())).astype(np.float32)
+    data[body_mask] = np.clip(data[body_mask] + noise, -1024.0, 3071.0)
+    output_file = save_corrupted(case_file, img, data, output_dir)
+    row = base_row(
+        case_file=case_file,
+        corruption_type="low_dose_noise",
+        z_start=0,
+        z_end_exclusive=data.shape[2],
+        changed_mask=body_mask,
+        lung_mask=lung_mask,
+        noise_sigma_hu=noise_sigma_hu,
+        quality_issue_fraction=min(noise_sigma_hu / 150.0, 1.0),
+        supports_region_filter=False,
+    )
+    row["removed_slices"] = 0
+    row["removed_fraction"] = 0.0
+    print(f"{case_file.name}: low_dose_noise sigma={noise_sigma_hu:g}HU -> {output_file}")
+    return row
+
+
+def clear_nii_outputs(output_dir: Path) -> None:
+    output_dir.mkdir(parents=True, exist_ok=True)
+    for path in output_dir.glob("*.nii.gz"):
+        path.unlink()
+
+
+def generate_default_protocol(
+    cases_per_type: int,
+    output_dir: Path,
+    documentation_path: Path,
+    clear_output: bool,
+    noise_sigma_hu: float,
+    seed: int,
+) -> pd.DataFrame:
+    if clear_output:
+        clear_nii_outputs(output_dir)
+    else:
+        output_dir.mkdir(parents=True, exist_ok=True)
+
+    OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
+    cases = list_cases(DATA_DIR)
+    protocol = [
+        ("lung_region_occlusion", 0),
+        ("full_slice_dropout", cases_per_type),
+        ("low_dose_noise", cases_per_type * 2),
+    ]
+
+    rows = []
+    for corruption_type, start_idx in protocol:
+        selected_cases = cases[start_idx : start_idx + cases_per_type]
+        for case_offset, case_file in enumerate(selected_cases):
+            if corruption_type == "lung_region_occlusion":
+                row = corrupt_lung_region_occlusion(case_file, output_dir)
+            elif corruption_type == "full_slice_dropout":
+                row = corrupt_full_slice_dropout(case_file, output_dir)
+            elif corruption_type == "low_dose_noise":
+                rng = np.random.default_rng(seed + start_idx + case_offset)
+                row = corrupt_low_dose_noise(case_file, output_dir, rng, noise_sigma_hu)
+            else:
+                raise ValueError(f"Unsupported corruption_type: {corruption_type}")
+            if row is not None:
+                rows.append(row)
+
+    documentation = pd.DataFrame(rows, columns=DOCUMENTATION_COLUMNS)
+    documentation_path.parent.mkdir(parents=True, exist_ok=True)
+    documentation.to_csv(documentation_path, index=False)
+    print(f"Wrote documentation: {documentation_path}")
+    return documentation
+
+
+def main() -> None:
+    parser = argparse.ArgumentParser(description="Generate NLST robustness corruptions.")
+    parser.add_argument(
+        "--cases-per-type",
+        type=int,
+        default=10,
+        help="Number of cases for each corruption type. Default creates 30 total cases.",
+    )
+    parser.add_argument(
+        "--noise-sigma-hu",
+        type=float,
+        default=75.0,
+        help="Gaussian HU noise sigma for low_dose_noise cases.",
+    )
+    parser.add_argument(
+        "--seed",
+        type=int,
+        default=0,
+        help="Random seed for low_dose_noise.",
+    )
+    parser.add_argument(
+        "--output-dir",
+        default=str(CORRUPTED_DATA_DIR),
+        help="Folder for corrupted NIfTI files.",
+    )
+    parser.add_argument(
+        "--documentation",
+        default=str(DOCUMENTATION_PATH),
+        help="CSV path for corruption metadata.",
+    )
+    parser.add_argument(
+        "--keep-existing",
+        action="store_true",
+        help="Do not remove existing .nii.gz files from the corrupted output folder first.",
+    )
+    args = parser.parse_args()
+
+    generate_default_protocol(
+        cases_per_type=args.cases_per_type,
+        output_dir=Path(args.output_dir),
+        documentation_path=Path(args.documentation),
+        clear_output=not args.keep_existing,
+        noise_sigma_hu=args.noise_sigma_hu,
+        seed=args.seed,
+    )
+
+
 if __name__ == "__main__":
-    # documentation cv:
-    documentation = pd.DataFrame(columns=["filename", "corruption_type", "z_start", "z_end", "removed_slices", "removed_fraction"])
-    #corrupt_upper_part_nlst_data(num_cases=10, start_case=0, documentation=documentation)
-    #corrupt_partial_upper_part_nlst_data(num_cases=10, start_case=10, documentation=documentation)
-    #corrupt_lower_part_nlst_data(num_cases=10, start_case=20, documentation=documentation)
-    crop_images_z_axis(num_cases=1, start_case=0, start=0, percentage=0.5, documentation=documentation)
-    crop_images_x_axis(num_cases=1, start_case=0, start=0, percentage=0.5, documentation=documentation)
-    crop_images_y_axis(num_cases=1, start_case=0, start=0, percentage=0.5, documentation=documentation)
-    documentation.to_csv(os.path.join(os.path.join(PROJECT_ROOT, "nlst_detection_outputs"), "corruption_documentation.csv"), index=False)
+    main()

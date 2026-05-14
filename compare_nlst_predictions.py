@@ -11,6 +11,7 @@ import argparse
 import csv
 import json
 import os
+from collections import defaultdict
 from pathlib import Path
 
 import numpy as np
@@ -25,6 +26,16 @@ def load_predictions(path: str) -> dict[str, dict]:
         key = os.path.basename(entry["image"])
         predictions[key] = entry
     return predictions
+
+
+def load_corruption_documentation(path: str | None) -> dict[str, dict]:
+    if not path:
+        return {}
+    if not os.path.exists(path):
+        raise FileNotFoundError(f"Corruption documentation not found: {path}")
+
+    with open(path, newline="") as f:
+        return {row["filename"]: row for row in csv.DictReader(f)}
 
 
 def filter_by_score(entry: dict, score_threshold: float) -> tuple[np.ndarray, np.ndarray]:
@@ -96,6 +107,7 @@ def summarize_case(
     corrupted_entry: dict,
     score_threshold: float,
     iou_threshold: float,
+    corruption_documentation: dict[str, dict],
 ) -> dict:
     original_boxes, original_scores = filter_by_score(original_entry, score_threshold)
     corrupted_boxes, corrupted_scores = filter_by_score(corrupted_entry, score_threshold)
@@ -112,9 +124,14 @@ def summarize_case(
     matched_count = len(matches)
     disappeared_count = original_count - matched_count
     new_count = corrupted_count - matched_count
+    doc = corruption_documentation.get(filename, {})
 
     return {
         "filename": filename,
+        "corruption_type": doc.get("corruption_type", "unknown"),
+        "removed_slices": doc.get("removed_slices", ""),
+        "removed_fraction": doc.get("removed_fraction", ""),
+        "changed_lung_fraction": doc.get("changed_lung_fraction", ""),
         "score_threshold": score_threshold,
         "iou_threshold": iou_threshold,
         "original_count": original_count,
@@ -122,6 +139,9 @@ def summarize_case(
         "matched_count": matched_count,
         "disappeared_count": disappeared_count,
         "new_count": new_count,
+        "disappearance_rate": float(disappeared_count / original_count) if original_count else 0.0,
+        "new_detection_rate": float(new_count / corrupted_count) if corrupted_count else 0.0,
+        "detection_delta": corrupted_count - original_count,
         "original_max_score": float(original_scores.max()) if original_count else "",
         "corrupted_max_score": float(corrupted_scores.max()) if corrupted_count else "",
         "mean_matched_iou": float(np.mean(matched_ious)) if matched_ious else "",
@@ -133,6 +153,10 @@ def write_summary(rows: list[dict], output_path: str) -> None:
     Path(output_path).parent.mkdir(parents=True, exist_ok=True)
     fieldnames = [
         "filename",
+        "corruption_type",
+        "removed_slices",
+        "removed_fraction",
+        "changed_lung_fraction",
         "score_threshold",
         "iou_threshold",
         "original_count",
@@ -140,6 +164,9 @@ def write_summary(rows: list[dict], output_path: str) -> None:
         "matched_count",
         "disappeared_count",
         "new_count",
+        "disappearance_rate",
+        "new_detection_rate",
+        "detection_delta",
         "original_max_score",
         "corrupted_max_score",
         "mean_matched_iou",
@@ -150,6 +177,73 @@ def write_summary(rows: list[dict], output_path: str) -> None:
         writer = csv.DictWriter(f, fieldnames=fieldnames)
         writer.writeheader()
         writer.writerows(rows)
+
+
+def numeric_values(rows: list[dict], key: str) -> list[float]:
+    values = []
+    for row in rows:
+        value = row.get(key, "")
+        if value == "":
+            continue
+        values.append(float(value))
+    return values
+
+
+def aggregate_rows(rows: list[dict]) -> list[dict]:
+    groups = {"overall": rows}
+    by_type = defaultdict(list)
+    for row in rows:
+        by_type[row["corruption_type"]].append(row)
+    groups.update({f"type:{key}": value for key, value in sorted(by_type.items())})
+
+    output = []
+    for group_name, group_rows in groups.items():
+        total_original = sum(row["original_count"] for row in group_rows)
+        total_corrupted = sum(row["corrupted_count"] for row in group_rows)
+        total_matched = sum(row["matched_count"] for row in group_rows)
+        total_disappeared = sum(row["disappeared_count"] for row in group_rows)
+        total_new = sum(row["new_count"] for row in group_rows)
+        matched_ious = numeric_values(group_rows, "mean_matched_iou")
+        score_deltas = numeric_values(group_rows, "mean_score_delta")
+
+        output.append(
+            {
+                "group": group_name,
+                "cases": len(group_rows),
+                "total_original_detections": total_original,
+                "total_corrupted_detections": total_corrupted,
+                "total_matched_detections": total_matched,
+                "total_disappeared_detections": total_disappeared,
+                "total_new_detections": total_new,
+                "disappearance_rate": float(total_disappeared / total_original) if total_original else 0.0,
+                "new_detection_rate": float(total_new / total_corrupted) if total_corrupted else 0.0,
+                "mean_matched_iou": float(np.mean(matched_ious)) if matched_ious else "",
+                "mean_score_delta": float(np.mean(score_deltas)) if score_deltas else "",
+            }
+        )
+    return output
+
+
+def write_aggregates(rows: list[dict], output_path: str) -> None:
+    aggregate = aggregate_rows(rows)
+    Path(output_path).parent.mkdir(parents=True, exist_ok=True)
+    fieldnames = [
+        "group",
+        "cases",
+        "total_original_detections",
+        "total_corrupted_detections",
+        "total_matched_detections",
+        "total_disappeared_detections",
+        "total_new_detections",
+        "disappearance_rate",
+        "new_detection_rate",
+        "mean_matched_iou",
+        "mean_score_delta",
+    ]
+    with open(output_path, "w", newline="") as f:
+        writer = csv.DictWriter(f, fieldnames=fieldnames)
+        writer.writeheader()
+        writer.writerows(aggregate)
 
 
 def main() -> None:
@@ -169,13 +263,32 @@ def main() -> None:
         default="nlst_detection_outputs/original_vs_corrupted_summary.csv",
         help="Output CSV summary path.",
     )
+    parser.add_argument(
+        "--aggregate-output",
+        default="nlst_detection_outputs/original_vs_corrupted_aggregates.csv",
+        help="Output CSV with overall and per-corruption aggregates.",
+    )
+    parser.add_argument(
+        "--corruption-documentation",
+        default="nlst_detection_outputs/corruption_documentation.csv",
+        help="CSV produced by generate_corrupt_data.py.",
+    )
     parser.add_argument("--score-threshold", type=float, default=0.3)
     parser.add_argument("--iou-threshold", type=float, default=0.1)
     args = parser.parse_args()
 
     original = load_predictions(args.original)
     corrupted = load_predictions(args.corrupted)
+    corruption_documentation = load_corruption_documentation(args.corruption_documentation)
     common_files = sorted(set(original) & set(corrupted))
+    if not common_files:
+        raise SystemExit(
+            "Compared 0 common cases. Refusing to overwrite summaries with empty results.\n"
+            f"Original file: {args.original} ({len(original)} cases)\n"
+            f"Corrupted file: {args.corrupted} ({len(corrupted)} cases)\n"
+            "This usually means corrupted inference failed, stale files are being used, "
+            "or image basenames do not match."
+        )
 
     rows = [
         summarize_case(
@@ -184,10 +297,12 @@ def main() -> None:
             corrupted[filename],
             args.score_threshold,
             args.iou_threshold,
+            corruption_documentation,
         )
         for filename in common_files
     ]
     write_summary(rows, args.output)
+    write_aggregates(rows, args.aggregate_output)
 
     total_original = sum(row["original_count"] for row in rows)
     total_corrupted = sum(row["corrupted_count"] for row in rows)
@@ -202,6 +317,7 @@ def main() -> None:
     print(f"Disappeared detections: {total_disappeared}")
     print(f"New detections: {total_new}")
     print(f"Wrote: {args.output}")
+    print(f"Wrote: {args.aggregate_output}")
 
 
 if __name__ == "__main__":

@@ -1,3 +1,7 @@
 NLST/
 model_zoo/
+model-zoo/
 nlst_detection_outputs/
+__pycache__/
+*.py[cod]
+.DS_Store
