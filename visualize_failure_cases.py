@@ -83,6 +83,51 @@ def choose_cases(rows: list[dict], max_cases: int) -> list[tuple[str, dict]]:
     return selected[:max_cases]
 
 
+def cccwhd_to_xyzxyz(boxes: np.ndarray) -> np.ndarray:
+    centers = boxes[:, :3]
+    sizes = boxes[:, 3:]
+    half_sizes = sizes / 2.0
+    return np.concatenate([centers - half_sizes, centers + half_sizes], axis=1)
+
+
+def box_iou_3d(box_a: np.ndarray, box_b: np.ndarray) -> float:
+    a = cccwhd_to_xyzxyz(box_a.reshape(1, 6))[0]
+    b = cccwhd_to_xyzxyz(box_b.reshape(1, 6))[0]
+    inter_min = np.maximum(a[:3], b[:3])
+    inter_max = np.minimum(a[3:], b[3:])
+    inter_size = np.maximum(inter_max - inter_min, 0.0)
+    inter_volume = float(np.prod(inter_size))
+    volume_a = float(np.prod(np.maximum(a[3:] - a[:3], 0.0)))
+    volume_b = float(np.prod(np.maximum(b[3:] - b[:3], 0.0)))
+    union = volume_a + volume_b - inter_volume
+    return 0.0 if union <= 0 else inter_volume / union
+
+
+def match_boxes(original_boxes: list[list[float]], corrupted_boxes: list[list[float]], iou_threshold: float) -> list[tuple[int, int, float]]:
+    if not original_boxes or not corrupted_boxes:
+        return []
+    original_array = np.asarray(original_boxes, dtype=float)
+    corrupted_array = np.asarray(corrupted_boxes, dtype=float)
+    candidates = []
+    for original_idx, original_box in enumerate(original_array):
+        for corrupted_idx, corrupted_box in enumerate(corrupted_array):
+            iou = box_iou_3d(original_box, corrupted_box)
+            if iou >= iou_threshold:
+                candidates.append((iou, original_idx, corrupted_idx))
+
+    candidates.sort(reverse=True)
+    used_original = set()
+    used_corrupted = set()
+    matches = []
+    for iou, original_idx, corrupted_idx in candidates:
+        if original_idx in used_original or corrupted_idx in used_corrupted:
+            continue
+        used_original.add(original_idx)
+        used_corrupted.add(corrupted_idx)
+        matches.append((original_idx, corrupted_idx, iou))
+    return matches
+
+
 def resolve_image(filename: str, image_dir: str) -> Path:
     path = Path(image_dir) / filename
     if path.exists():
@@ -102,15 +147,22 @@ def world_to_voxel(point: np.ndarray, affine: np.ndarray) -> np.ndarray:
     return (np.linalg.inv(affine) @ homogeneous)[:3]
 
 
-def box_to_voxel_bounds(box: list[float], affine: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
-    world_min, world_max = cccwhd_to_world_bounds(box)
-    corners = []
-    for x in [world_min[0], world_max[0]]:
-        for y in [world_min[1], world_max[1]]:
-            for z in [world_min[2], world_max[2]]:
-                corners.append(world_to_voxel(np.asarray([x, y, z]), affine))
-    corners_array = np.asarray(corners)
-    return corners_array.min(axis=0), corners_array.max(axis=0)
+def box_to_display_bounds(box: list[float], image: nib.Nifti1Image) -> tuple[np.ndarray, np.ndarray]:
+    center_voxel = world_to_voxel(np.asarray(box[:3], dtype=float), image.affine)
+    spacing = np.sqrt((image.affine[:3, :3] ** 2).sum(axis=0))
+    spacing = np.where(spacing == 0, 1.0, spacing)
+
+    # The MONAI bundle returns x/y in an LPS-like sign convention for these
+    # NLST files, while the displayed array indices are positive voxel indices.
+    for axis in (0, 1):
+        if center_voxel[axis] < 0 or center_voxel[axis] >= image.shape[axis]:
+            center_voxel[axis] = abs(center_voxel[axis])
+
+    size_voxel = np.asarray(box[3:], dtype=float) / spacing
+    half_size = size_voxel / 2.0
+    voxel_min = center_voxel - half_size
+    voxel_max = center_voxel + half_size
+    return voxel_min, voxel_max
 
 
 def filter_boxes(entry: dict, score_threshold: float) -> tuple[list[list[float]], list[float]]:
@@ -125,30 +177,78 @@ def filter_boxes(entry: dict, score_threshold: float) -> tuple[list[list[float]]
     return kept_boxes, kept_scores
 
 
-def choose_slice(original_entry: dict, corrupted_entry: dict, image_file: Path, score_threshold: float) -> int:
+def choose_evidence_box(
+    label: str,
+    original_entry: dict,
+    corrupted_entry: dict,
+    score_threshold: float,
+    iou_threshold: float,
+) -> tuple[str, int] | None:
+    original_boxes, original_scores = filter_boxes(original_entry, score_threshold)
+    corrupted_boxes, corrupted_scores = filter_boxes(corrupted_entry, score_threshold)
+    matches = match_boxes(original_boxes, corrupted_boxes, iou_threshold)
+    matched_original = {original_idx for original_idx, _, _ in matches}
+    matched_corrupted = {corrupted_idx for _, corrupted_idx, _ in matches}
+
+    if label == "new_detection":
+        candidates = [idx for idx in range(len(corrupted_boxes)) if idx not in matched_corrupted]
+        if candidates:
+            return "corrupted", max(candidates, key=lambda idx: corrupted_scores[idx])
+
+    if label == "disappeared":
+        candidates = [idx for idx in range(len(original_boxes)) if idx not in matched_original]
+        if candidates:
+            return "original", max(candidates, key=lambda idx: original_scores[idx])
+
+    if label == "score_drop" and matches:
+        original_idx, corrupted_idx, _ = min(
+            matches,
+            key=lambda match: corrupted_scores[match[1]] - original_scores[match[0]],
+        )
+        return "original", original_idx
+
+    if matches:
+        original_idx, _, _ = max(matches, key=lambda match: match[2])
+        return "original", original_idx
+    if original_boxes:
+        return "original", int(np.argmax(original_scores))
+    if corrupted_boxes:
+        return "corrupted", int(np.argmax(corrupted_scores))
+    return None
+
+
+def choose_slice(
+    label: str,
+    original_entry: dict,
+    corrupted_entry: dict,
+    image_file: Path,
+    score_threshold: float,
+    iou_threshold: float,
+) -> int:
     image = nib.load(str(image_file))
-    boxes, _ = filter_boxes(original_entry, score_threshold)
-    if not boxes:
-        boxes, _ = filter_boxes(corrupted_entry, score_threshold)
-    if not boxes:
+    evidence = choose_evidence_box(label, original_entry, corrupted_entry, score_threshold, iou_threshold)
+    if evidence is None:
         return image.shape[2] // 2
-    center = np.asarray([boxes[0][0], boxes[0][1], boxes[0][2]], dtype=float)
+    source, idx = evidence
+    boxes, _ = filter_boxes(original_entry if source == "original" else corrupted_entry, score_threshold)
+    center = np.asarray(boxes[idx][:3], dtype=float)
     z = int(round(world_to_voxel(center, image.affine)[2]))
     return int(np.clip(z, 0, image.shape[2] - 1))
 
 
-def draw_boxes(ax, entry: dict, image: nib.Nifti1Image, z_slice: int, score_threshold: float, color: str) -> None:
+def draw_boxes(ax, entry: dict, image: nib.Nifti1Image, z_slice: int, score_threshold: float, color: str, prefix: str) -> None:
     boxes, scores = filter_boxes(entry, score_threshold)
     for box, score in zip(boxes, scores):
-        voxel_min, voxel_max = box_to_voxel_bounds(box, image.affine)
+        voxel_min, voxel_max = box_to_display_bounds(box, image)
         if not (voxel_min[2] <= z_slice <= voxel_max[2]):
             continue
-        x = voxel_min[0]
-        y = voxel_min[1]
+        x = max(voxel_min[0], 0)
+        y = max(voxel_min[1], 0)
         width = max(voxel_max[0] - voxel_min[0], 1.0)
         height = max(voxel_max[1] - voxel_min[1], 1.0)
         ax.add_patch(Rectangle((x, y), width, height, fill=False, edgecolor=color, linewidth=1.8))
-        ax.text(x, y, f"{score:.2f}", color=color, fontsize=8, weight="bold")
+        ax.plot((voxel_min[0] + voxel_max[0]) / 2.0, (voxel_min[1] + voxel_max[1]) / 2.0, marker="+", color=color)
+        ax.text(x, y, f"{prefix} {score:.2f}", color=color, fontsize=8, weight="bold")
 
 
 def plot_case(
@@ -160,6 +260,7 @@ def plot_case(
     corrupted_image_dir: str,
     output_dir: Path,
     score_threshold: float,
+    iou_threshold: float,
 ) -> Path:
     filename = row["filename"]
     original_file = resolve_image(filename, original_image_dir)
@@ -171,7 +272,7 @@ def plot_case(
 
     original_entry = original_predictions[filename]
     corrupted_entry = corrupted_predictions[filename]
-    z_slice = choose_slice(original_entry, corrupted_entry, original_file, score_threshold)
+    z_slice = choose_slice(label, original_entry, corrupted_entry, original_file, score_threshold, iou_threshold)
 
     fig, axes = plt.subplots(1, 2, figsize=(10, 5), constrained_layout=True)
     for ax, data, image, entry, title, color in [
@@ -179,7 +280,7 @@ def plot_case(
         (axes[1], corrupted_data, corrupted_img, corrupted_entry, "corrupted", "red"),
     ]:
         ax.imshow(data[:, :, z_slice].T, cmap="gray", origin="lower", vmin=-1000, vmax=400)
-        draw_boxes(ax, entry, image, z_slice, score_threshold, color)
+        draw_boxes(ax, entry, image, z_slice, score_threshold, color, "clean" if title == "clean" else "corr")
         ax.set_title(title)
         ax.axis("off")
 
@@ -216,6 +317,7 @@ def main() -> None:
     parser.add_argument("--corrupted-image-dir", default="NLST/corrupted_imagesTr")
     parser.add_argument("--output-dir", default="nlst_detection_outputs/visual_evidence")
     parser.add_argument("--score-threshold", type=float, default=0.3)
+    parser.add_argument("--iou-threshold", type=float, default=0.1)
     parser.add_argument("--max-cases", type=int, default=4)
     args = parser.parse_args()
 
@@ -236,6 +338,7 @@ def main() -> None:
                 corrupted_image_dir=args.corrupted_image_dir,
                 output_dir=Path(args.output_dir),
                 score_threshold=args.score_threshold,
+                iou_threshold=args.iou_threshold,
             )
         )
 
